@@ -5,7 +5,7 @@ set -e
 
 ROOTFS_SIZE="10G"
 SUITE="bookworm"
-MIRROR="https://mirrors.tuna.tsinghua.edu.cn/debian"
+MIRROR="https://deb.debian.org/debian"
 INCLUDE_PKGS="systemd-sysv,udev,dbus,\
 iproute2,iputils-ping,ifupdown,isc-dhcp-client,\
 ca-certificates,curl,wget,\
@@ -41,6 +41,30 @@ cleanup() {
 }
 trap cleanup EXIT
 
+run_debootstrap() {
+    local args=("$@")
+    local target_idx=$((${#args[@]} - 2))
+    local target_dir="${args[$target_idx]}"
+    local attempt
+
+    for attempt in 1 2 3; do
+        if [ "$attempt" -eq 1 ]; then
+            sudo debootstrap "${args[@]}" && return 0
+            echo "  WARNING: debootstrap failed; retrying with --no-check-gpg"
+        else
+            sudo debootstrap --no-check-gpg "${args[@]}" && return 0
+            echo "  WARNING: debootstrap attempt $attempt failed, retrying..."
+        fi
+
+        if [ -n "$target_dir" ] && [ -d "$target_dir" ]; then
+            sudo rm -rf "${target_dir:?}/"*
+        fi
+        sleep 2
+    done
+
+    return 1
+}
+
 echo "[1/5] Creating raw image..."
 truncate -s "$ROOTFS_SIZE" "$WORK_DIR/rootfs.raw"
 mkfs.ext4 -F "$WORK_DIR/rootfs.raw"
@@ -51,13 +75,13 @@ mkdir -p "$MOUNT_DIR"
 sudo mount -o loop "$WORK_DIR/rootfs.raw" "$MOUNT_DIR"
 if [ -f "$CACHE_TAR" ]; then
     echo "  Using cached tarball: $CACHE_TAR"
-    sudo debootstrap --include="$INCLUDE_PKGS" \
+    run_debootstrap --include="$INCLUDE_PKGS" \
         --unpack-tarball="$CACHE_TAR" "$SUITE" "$MOUNT_DIR" "$MIRROR"
 else
     echo "  No cache found, downloading packages (first run)..."
-    sudo debootstrap --include="$INCLUDE_PKGS" \
+    run_debootstrap --include="$INCLUDE_PKGS" \
         --make-tarball="$CACHE_TAR" "$SUITE" "$WORK_DIR/tarball-tmp" "$MIRROR"
-    sudo debootstrap --include="$INCLUDE_PKGS" \
+    run_debootstrap --include="$INCLUDE_PKGS" \
         --unpack-tarball="$CACHE_TAR" "$SUITE" "$MOUNT_DIR" "$MIRROR"
 fi
 
@@ -84,12 +108,12 @@ echo "tenclaw-vm" > /etc/hostname
 echo "/dev/vda / ext4 defaults 0 1" > /etc/fstab
 
 cat > /etc/apt/sources.list << 'APT'
-deb https://mirrors.tuna.tsinghua.edu.cn/debian bookworm main contrib non-free non-free-firmware
-deb https://mirrors.tuna.tsinghua.edu.cn/debian bookworm-updates main contrib non-free non-free-firmware
-deb https://mirrors.tuna.tsinghua.edu.cn/debian-security bookworm-security main contrib non-free non-free-firmware
+deb https://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+deb https://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
+deb https://deb.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
 APT
 
-apt-get update
+apt-get -o Acquire::Check-Date=false update
 update-ca-certificates --fresh 2>/dev/null || true
 apt-get clean
 rm -rf /var/lib/apt/lists/*

@@ -9,10 +9,29 @@ OUTDIR="$(mkdir -p "${1:-$SCRIPT_DIR/../build}" && cd "${1:-$SCRIPT_DIR/../build
 WORKDIR=$(mktemp -d)
 trap "rm -rf $WORKDIR" EXIT
 
+resolve_kernel_pkg() {
+    local meta dep
+    for meta in linux-image-amd64 linux-image-generic; do
+        if apt-cache show "$meta" >/dev/null 2>&1; then
+            dep=$(apt-cache depends "$meta" 2>/dev/null \
+                | sed -n 's/.*Depends: \(linux-image-[0-9][^ ]*\).*/\1/p' \
+                | head -n 1)
+            if [ -n "$dep" ]; then
+                echo "$dep"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+download_pkg() {
+    apt-get download "$1" 2>/dev/null || apt download "$1" 2>/dev/null
+}
+
 echo "[1/5] Downloading BusyBox static binary..."
 cd "$WORKDIR"
-apt-get download busybox-static 2>/dev/null || \
-    apt download busybox-static 2>/dev/null
+download_pkg busybox-static
 dpkg-deb -x busybox-static*.deb extract/
 cp extract/bin/busybox "$WORKDIR/busybox"
 chmod +x "$WORKDIR/busybox"
@@ -22,22 +41,38 @@ mkdir -p "$WORKDIR/initramfs"/{bin,dev,proc,sys,etc,tmp,lib/modules}
 cp "$WORKDIR/busybox" "$WORKDIR/initramfs/bin/"
 
 echo "[3/5] Extracting virtio kernel modules from Debian package..."
-# The vmlinuz we use is from a specific Debian kernel package.
-# Download and extract modules from that same package to ensure version match.
-KVER="5.10.0-38-amd64"
-KPKG="linux-image-${KVER}"
-echo "  Downloading $KPKG (contains kernel modules) ..."
+# Download modules from the same package family used for the kernel image.
+KPKG=$(resolve_kernel_pkg || true)
+if [ -z "$KPKG" ]; then
+    echo "ERROR: Failed to resolve a linux-image package." >&2
+    exit 1
+fi
+echo "  Downloading $KPKG (and module dependencies) ..."
 
 cd "$WORKDIR"
-apt-get download "$KPKG" 2>/dev/null || \
-    apt download "$KPKG" 2>/dev/null || {
+download_pkg "$KPKG" || {
     echo "ERROR: Failed to download $KPKG."
-    echo "  Try: apt-cache search linux-image-5.10.0"
-    echo "  to find the correct package name."
+    echo "  Try: apt-cache search linux-image-"
     exit 1
 }
+
+for dep_pkg in $(apt-cache depends "$KPKG" 2>/dev/null \
+    | sed -n 's/.*Depends: \(linux-modules[^ ]*\).*/\1/p'); do
+    download_pkg "$dep_pkg" || true
+done
+
 mkdir -p kmod_extract
-dpkg-deb -x linux-image-*.deb kmod_extract/
+for deb in ./*.deb; do
+    [ -f "$deb" ] || continue
+    dpkg-deb -x "$deb" kmod_extract/
+done
+
+KVER=$(find kmod_extract/lib/modules -mindepth 1 -maxdepth 1 -type d \
+    | sed -n '1s#^.*/##p')
+if [ -z "$KVER" ]; then
+    echo "ERROR: No kernel modules found in downloaded packages." >&2
+    exit 1
+fi
 
 MODDIR="kmod_extract/lib/modules/$KVER/kernel"
 DESTDIR="$WORKDIR/initramfs/lib/modules"
@@ -62,18 +97,34 @@ VIRTIO_MODS=(
 for relmod in "${VIRTIO_MODS[@]}"; do
     modname="$(basename $relmod)"
     src="$MODDIR/$relmod"
+    found=""
     # Try plain .ko, .ko.xz, .ko.zst
     if [ -f "$src" ]; then
-        cp "$src" "$DESTDIR/"
-        echo "  Copied: $modname"
+        found="$src"
     elif [ -f "${src}.xz" ]; then
-        xz -d < "${src}.xz" > "$DESTDIR/$modname"
-        echo "  Decompressed: $modname (.xz)"
+        found="${src}.xz"
     elif [ -f "${src}.zst" ]; then
-        zstd -d "${src}.zst" -o "$DESTDIR/$modname" 2>/dev/null
-        echo "  Decompressed: $modname (.zst)"
+        found="${src}.zst"
     else
+        found=$(find "$MODDIR" -type f \
+            \( -name "$modname" -o -name "${modname}.xz" -o -name "${modname}.zst" \) \
+            | sed -n '1p')
+    fi
+
+    if [ -z "$found" ]; then
         echo "  WARNING: $modname not found in $KPKG"
+        continue
+    fi
+
+    if [ "$found" = "${found%.xz}" ] && [ "$found" = "${found%.zst}" ]; then
+        cp "$found" "$DESTDIR/"
+        echo "  Copied: $modname"
+    elif [ "$found" != "${found%.xz}" ]; then
+        xz -d < "$found" > "$DESTDIR/$modname"
+        echo "  Decompressed: $modname (.xz)"
+    else
+        zstd -d "$found" -o "$DESTDIR/$modname" 2>/dev/null
+        echo "  Decompressed: $modname (.zst)"
     fi
 done
 
